@@ -1,0 +1,207 @@
+diff --git a/src/dawn/native/d3d/SwapChainD3D.cpp b/src/dawn/native/d3d/SwapChainD3D.cpp
+index 7c6bac0c3..a74687de9 100644
+--- a/src/dawn/native/d3d/SwapChainD3D.cpp
++++ b/src/dawn/native/d3d/SwapChainD3D.cpp
+@@ -171,6 +171,14 @@ MaybeError SwapChain::Initialize(SwapChainBase* previousSwapChain) {
+     // the buffers.
+     mDXGISwapChain = std::move(previousD3DSwapChain->mDXGISwapChain);
+ 
++    // Transfer DirectComposition state with the swap chain so the DComp visual
++    // tree remains valid across resize/reconfigure cycles.
++    mDCompDevice = std::move(previousD3DSwapChain->mDCompDevice);
++    mDCompTarget  = std::move(previousD3DSwapChain->mDCompTarget);
++    mDCompVisual  = std::move(previousD3DSwapChain->mDCompVisual);
++    mUseDComp = previousD3DSwapChain->mUseDComp;
++    previousD3DSwapChain->mUseDComp = false;
++
+     bool canReuseBuffers = GetWidth() == previousSwapChain->GetWidth() &&
+                            GetHeight() == previousSwapChain->GetHeight() &&
+                            GetFormat() == previousSwapChain->GetFormat() &&
+@@ -220,19 +228,49 @@ MaybeError SwapChain::InitializeSwapChainFromScratch() {
+     DAWN_TRY(CheckHRESULT(device->GetFactory()->QueryInterface(IID_PPV_ARGS(&factory2)),
+                           "Getting IDXGIFactory2"));
+ 
++    // Capture HWND early; used for DComp setup after the swap chain is created.
++    HWND hwndForDComp = nullptr;
++
+     ComPtr<IDXGISwapChain1> swapChain1;
+     switch (GetSurface()->GetType()) {
+         case Surface::Type::WindowsHWND: {
+-            DAWN_TRY(CheckHRESULT(
+-                factory2->CreateSwapChainForHwnd(GetD3DDeviceForCreatingSwapChain(),
+-                                                 static_cast<HWND>(GetSurface()->GetHWND()),
+-                                                 &swapChainDesc, nullptr, nullptr, &swapChain1),
+-                "Creating the IDXGISwapChain1"));
+-
+-            DAWN_TRY(
+-                CheckHRESULT(factory2->MakeWindowAssociation(
+-                                 static_cast<HWND>(GetSurface()->GetHWND()), DXGI_MWA_NO_ALT_ENTER),
+-                             "Disabling DXGI's alt+enter fullscreen handling"));
++            HWND hwnd = static_cast<HWND>(GetSurface()->GetHWND());
++
++            // On D3D12 use CreateSwapChainForComposition so the swap chain is
++            // presented through a DirectComposition visual tree rather than being
++            // bound directly to the HWND.  This decouples DXGI from Win32 resize
++            // events, eliminating the black/white flash ("trembling") that
++            // CreateSwapChainForHwnd causes during WM_SIZE processing.
++            //
++            // On D3D11 keep the classic CreateSwapChainForHwnd path because its
++            // resize model is different and does not suffer the same issue.
++            if (GetBackendType() == wgpu::BackendType::D3D12) {
++                DAWN_TRY(CheckHRESULT(
++                    factory2->CreateSwapChainForComposition(
++                        GetD3DDeviceForCreatingSwapChain(), &swapChainDesc, nullptr, &swapChain1),
++                    "Creating IDXGISwapChain1 (DComp composition path)"));
++
++                // Prevent DXGI from monitoring window-state changes.  This stops
++                // GFE / ALT+Z overlay injection and removes the residual DXGI
++                // resize signal that can still trigger a flash.
++                DAWN_TRY(CheckHRESULT(
++                    factory2->MakeWindowAssociation(
++                        hwnd,
++                        DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER |
++                            DXGI_MWA_NO_PRINT_SCREEN),
++                    "MakeWindowAssociation (DComp path)"));
++
++                hwndForDComp = hwnd;
++            } else {
++                // D3D11 classic path — unchanged.
++                DAWN_TRY(CheckHRESULT(
++                    factory2->CreateSwapChainForHwnd(GetD3DDeviceForCreatingSwapChain(), hwnd,
++                                                     &swapChainDesc, nullptr, nullptr, &swapChain1),
++                    "Creating the IDXGISwapChain1"));
++                DAWN_TRY(CheckHRESULT(
++                    factory2->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER),
++                    "Disabling DXGI's alt+enter fullscreen handling"));
++            }
+             break;
+         }
+         case Surface::Type::WindowsCoreWindow: {
+@@ -277,6 +315,11 @@ MaybeError SwapChain::InitializeSwapChainFromScratch() {
+ 
+     DAWN_TRY(CheckHRESULT(swapChain1.As(&mDXGISwapChain), "Gettting IDXGISwapChain1"));
+ 
++    // Wire up DirectComposition for the HWND D3D12 path.
++    if (hwndForDComp != nullptr) {
++        DAWN_TRY(InitDComp(hwndForDComp, swapChain1.Get()));
++    }
++
+     return CollectSwapChainBuffers();
+ }
+ 
+@@ -288,10 +331,18 @@ MaybeError SwapChain::PresentDXGISwapChain() {
+         DAWN_TRY(CheckHRESULT(presentResult, "IDXGISwapChain::Present"));
+     }
+ 
++    // Flush the DComp visual tree so DWM composites the new frame atomically.
++    // Required when using CreateSwapChainForComposition; a no-op commit is
++    // cheap (~microseconds) and ensures the DWM sees a consistent state.
++    if (mUseDComp && mDCompDevice) {
++        mDCompDevice->Commit();  // fire-and-forget; errors are non-fatal here
++    }
++
+     return {};
+ }
+ 
+ void SwapChain::ReleaseDXGISwapChain() {
++    TeardownDComp();
+     mDXGISwapChain = nullptr;
+ }
+ 
+@@ -303,4 +354,61 @@ const SwapChain::Config& SwapChain::GetConfig() const {
+     return mConfig;
+ }
+ 
++// ── DirectComposition helpers ─────────────────────────────────────────────────
++//
++// InitDComp wires a freshly-created composition swap chain into a DComp visual
++// tree so DWM composites it without observing Win32 resize events.
++//
++// Visual tree:
++//   IDCompositionTarget (HWND root, topmost)
++//     └─ IDCompositionVisual
++//          └─ IDXGISwapChain1 (content)
++//
++// The visual has no explicit transform or clip — it maps 1:1 to the window at
++// all times.  When ResizeBuffers is called the content dimensions update and
++// DWM adjusts on the next composite cycle cleanly.
++
++MaybeError SwapChain::InitDComp(HWND hwnd, IDXGISwapChain1* sc) {
++    // DCompositionCreateDevice(nullptr) creates a software DComp device backed
++    // by its own DXGI device.  This is independent of the D3D12 rendering device
++    // and works on any Windows 8+ / 10 system.
++    DAWN_TRY(CheckHRESULT(
++        DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&mDCompDevice)),
++        "DCompositionCreateDevice"));
++
++    // Attach the DComp visual tree to the HWND.  topmost=TRUE places it above
++    // the default visual layer (correct for a full-window renderer).
++    DAWN_TRY(CheckHRESULT(
++        mDCompDevice->CreateTargetForHwnd(hwnd, TRUE, &mDCompTarget),
++        "IDCompositionDevice::CreateTargetForHwnd"));
++
++    DAWN_TRY(CheckHRESULT(
++        mDCompDevice->CreateVisual(&mDCompVisual),
++        "IDCompositionDevice::CreateVisual"));
++
++    // Point the visual at the swap chain.
++    DAWN_TRY(CheckHRESULT(
++        mDCompVisual->SetContent(sc),
++        "IDCompositionVisual::SetContent"));
++
++    DAWN_TRY(CheckHRESULT(
++        mDCompTarget->SetRoot(mDCompVisual.Get()),
++        "IDCompositionTarget::SetRoot"));
++
++    // Commit the initial visual tree so DWM starts compositing this window.
++    DAWN_TRY(CheckHRESULT(
++        mDCompDevice->Commit(),
++        "IDCompositionDevice::Commit (initial)"));
++
++    mUseDComp = true;
++    return {};
++}
++
++void SwapChain::TeardownDComp() {
++    mDCompVisual  = nullptr;
++    mDCompTarget  = nullptr;
++    mDCompDevice  = nullptr;
++    mUseDComp     = false;
++}
++
+ }  // namespace dawn::native::d3d
+diff --git a/src/dawn/native/d3d/SwapChainD3D.h b/src/dawn/native/d3d/SwapChainD3D.h
+index f490f25b2..a90029024 100644
+--- a/src/dawn/native/d3d/SwapChainD3D.h
++++ b/src/dawn/native/d3d/SwapChainD3D.h
+@@ -30,6 +30,8 @@
+ 
+ #include <vector>
+ 
++#include <dcomp.h>  // DirectComposition — trembling-free resize via DComp visual tree
++
+ #include "dawn/native/IntegerTypes.h"
+ #include "dawn/native/SwapChain.h"
+ #include "dawn/native/d3d/d3d_platform.h"
+@@ -77,8 +79,21 @@ class SwapChain : public SwapChainBase {
+     // Does the swapchain initialization steps assuming there is nothing we can reuse.
+     MaybeError InitializeSwapChainFromScratch();
+ 
++    // DirectComposition helpers (D3D12 + HWND only).
++    // InitDComp wires the freshly-created swap chain into a DComp visual tree so
++    // that DWM composites it separately from HWND resize events, eliminating the
++    // black/white flash ("trembling") that CreateSwapChainForHwnd causes.
++    MaybeError InitDComp(HWND hwnd, IDXGISwapChain1* sc);
++    void       TeardownDComp();
++
+     Config mConfig;
+     ComPtr<IDXGISwapChain3> mDXGISwapChain;
++
++    // DirectComposition objects (valid only when mUseDComp == true).
++    ComPtr<IDCompositionDevice> mDCompDevice;
++    ComPtr<IDCompositionTarget>  mDCompTarget;
++    ComPtr<IDCompositionVisual>  mDCompVisual;
++    bool mUseDComp = false;
+ };
+ 
+ }  // namespace dawn::native::d3d
